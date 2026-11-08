@@ -1,5 +1,11 @@
 # LSPosed × SUSFS 隐藏方案
 
+> **English**: Hide LSPosed's `dex2oat` bind mount and `zygisk/*.so` mappings from
+> non-root processes on KernelSU + SUSFS kernels. LSPosed itself is left
+> untouched — 2.0.3 crashes if its module id or `daemon.apk` is modified, so the
+> mounts are hidden at the kernel level instead. See [Why not patch
+> LSPosed](#为什么不能改-lsposed).
+
 在 SUSFS 内核上隐藏 LSPosed 的两处进程级痕迹：
 
 - `/proc/self/mountinfo` 里 `bin/dex2oat` 的 bind mount（挂载源路径含 `zygisk_lsposed`）
@@ -14,7 +20,7 @@ LSPosed 2.0.3 的守护进程会把模块目录下的 `bin/dex2oat` bind-mount �
 `--inline-max-code-units=0`，防止被 hook 的方法被内联。
 
 这个挂载是在 **PID 1 的 mount namespace** 里建立的，所以**每个 App 读自己的
-`/proc/self/mountinfo` 都能看到**，无需 root。挂载源路径里直接带着模块 id：
+`/proc/self/mountinfo` 都能看到**，无需 root。挂载源路径里直接带着模块目录：
 
 ```
 /data/adb/modules/zygisk_lsposed/bin/dex2oat  ->  /apex/com.android.art/bin/dex2oat64
@@ -38,18 +44,35 @@ LSPosed 2.0.3 的守护进程会把模块目录下的 `bin/dex2oat` bind-mount �
 
 ## 原理
 
-SUSFS 提供三个能力（本项目用到前两个 + 第三个做补充）：
+SUSFS 提供三个能力：
 
 | 命令 | 作用 | 生效对象 |
 | --- | --- | --- |
+| `hide_sus_mnts_for_non_su_procs 1` | 打开"sus 挂载"过滤的**总开关**（默认关闭） | 非 root 进程 |
 | `add_sus_mount <挂载点>` | 该挂载点从 `/proc/self/{mounts,mountinfo,mountstats}` 隐藏 | 非 root 进程 |
-| `hide_sus_mnts_for_non_su_procs 1` | 打开上述过滤的**总开关**（默认关闭） | 非 root 进程 |
-| `add_sus_map <库路径>` | 该文件从 `/proc/self/{maps,smaps,...}` 隐藏 | uid ≥ 10000 |
+| `add_sus_map <库路径>` | 该文件从 `/proc/self/{maps,smaps,map_files,...}` 隐藏 | uid ≥ 10000 |
 
-注意 `add_sus_mount` 必须**在挂载建立之后**调用，否则无效。
+要点：
 
-本模块在开机后等待挂载出现，然后打标签并打开开关，60 秒后再补一次（防止其他模块在
-`boot-completed` 阶段把开关重置）。
+1. `add_sus_mount` 必须**在挂载建立之后**调用，否则无效；
+2. 只打标签不开总开关，等于没做——`hide_sus_mnts_for_non_su_procs` 默认是 0；
+3. 有些模块会在 `boot-completed` 阶段把总开关重置回 0，所以本模块会在 60 秒后再补一次。
+
+## 项目结构
+
+```
+.
+├── build.sh                    # 打包成 SystemHelper.zip
+├── module/
+│   ├── module.prop
+│   ├── common.sh               # 共享逻辑：定位框架目录、解析挂载点、打标签
+│   ├── service.sh              # late_start：等待挂载 → 打标签
+│   └── boot-completed.sh       # boot_completed：兜底再来一次
+└── .github/workflows/build.yml # shellcheck + 打包 + tag 自动发 Release
+```
+
+`common.sh` 不硬编码模块 id：它遍历 `/data/adb/modules/*` 找唯一带
+`bin/dex2oat` 的目录，再从 `/proc/self/mountinfo` 解析出实际挂载点。
 
 ## 依赖
 
@@ -60,7 +83,7 @@ SUSFS 提供三个能力（本项目用到前两个 + 第三个做补充）：
 
    本项目验证所用内核：<https://github.com/fouc3-mirror/Resukisu>
 
-   可用以下命令自检，返回 `SUSFS operation not supported` 说明内核未实现：
+   自检（返回 `SUSFS operation not supported` 说明内核未实现）：
 
    ```sh
    su -c "/data/adb/ksu/bin/ksu_susfs add_sus_mount /apex/com.android.art/bin/dex2oat64"
@@ -72,11 +95,10 @@ SUSFS 提供三个能力（本项目用到前两个 + 第三个做补充）：
 ## 安装
 
 ```sh
-# 在设备上（KernelSU / ksud）
 su -c "/data/adb/ksud module install /data/local/tmp/SystemHelper.zip"
 ```
 
-或直接把 `SystemHelper.zip` 用模块管理器刷入，重启。
+或用模块管理器直接刷入，重启生效。
 
 自行构建：
 
@@ -87,15 +109,17 @@ su -c "/data/adb/ksud module install /data/local/tmp/SystemHelper.zip"
 ## 验证
 
 ```sh
-# 1. 内核日志确认标签与开关都已生效
+# 1. 本模块的运行日志
+su -c cat /data/adb/system_helper.log
+# 期望：add_sus_mount /apex/com.android.art/bin/dex2oat64 等条目
+
+# 2. 内核侧确认
 su -c dmesg | grep -E 'susfs_add_sus_mount|hide_sus_mnts'
+# 期望：CMD_SUSFS_ADD_SUS_MOUNT -> ret: 0
+#       susfs_is_hide_sus_mnts_for_non_su_procs_enabled: 1
 
-# 2. 期望看到
-#    susfs_add_sus_mount CMD_SUSFS_ADD_SUS_MOUNT -> ret: 0
-#    susfs_is_hide_sus_mnts_for_non_su_procs_enabled: 1
-
-# 3. 从 App 视角确认（非 root，uid ≥ 10000）
-#    任意读取 /proc/self/mountinfo 的检测工具，应看不到 dex2oat 条目
+# 3. App 视角（uid ≥ 10000 的进程）
+#    读取 /proc/self/mountinfo 时应看不到 dex2oat 条目
 ```
 
 ## 工作流程
@@ -104,12 +128,10 @@ su -c dmesg | grep -E 'susfs_add_sus_mount|hide_sus_mnts'
 LSPosed daemon 启动
    └─ 在 PID 1 namespace bind-mount bin/dex2oat -> /apex/.../dex2oat{32,64}
         └─ system_helper 检测到挂载出现
-             ├─ ksu_susfs add_sus_mount /apex/com.android.art/bin/dex2oat64
-             ├─ ksu_susfs add_sus_mount /apex/com.android.art/bin/dex2oat32
              ├─ ksu_susfs hide_sus_mnts_for_non_su_procs 1
-             ├─ ksu_susfs add_sus_map .../zygisk/arm64-v8a.so
-             └─ ksu_susfs add_sus_map .../zygisk/armeabi-v7a.so
-                  └─ 60s 后重复一次（防止被其他模块重置）
+             ├─ ksu_susfs add_sus_mount <每个 dex2oat 挂载点>
+             ├─ ksu_susfs add_sus_map <moddir>/zygisk/*.so
+             └─ 60s 后重复一次（防止被其他模块重置）
 ```
 
 ## 限制
@@ -117,7 +139,7 @@ LSPosed daemon 启动
 - 守护进程若在运行中 `umount` 后又重新挂载，新挂载不带标签，会重新暴露直到下次重启。
 - `add_sus_map` 只对 uid ≥ 10000 的进程生效，system_server 等不受影响。
 - 管理器包名仍是 `org.lsposed.manager`，若检测方查询"已安装应用列表"，本方案覆盖不到。
-- 换回不支持上述命令的内核后，本模块会静默失效（命令错误被忽略），不会报错也不会影响开机。
+- 换回不支持上述命令的内核后，本模块会静默失效（错误写入日志），不影响开机。
 
 ## 致谢
 
