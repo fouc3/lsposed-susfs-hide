@@ -1,5 +1,7 @@
 # LSPosed × SUSFS 隐藏方案
 
+[![build](https://github.com/fouc3/lsposed-susfs-hide/actions/workflows/build.yml/badge.svg)](https://github.com/fouc3/lsposed-susfs-hide/actions/workflows/build.yml)
+
 > **English**: Hide LSPosed's `dex2oat` bind mount and `zygisk/*.so` mappings from
 > non-root processes on KernelSU + SUSFS kernels. LSPosed itself is left
 > untouched — 2.0.3 crashes if its module id or `daemon.apk` is modified, so the
@@ -103,7 +105,7 @@ su -c "/data/adb/ksud module install /data/local/tmp/SystemHelper.zip"
 自行构建：
 
 ```sh
-./build.sh          # 生成 SystemHelper.zip
+bash build.sh       # 生成 SystemHelper.zip
 ```
 
 ## 验证
